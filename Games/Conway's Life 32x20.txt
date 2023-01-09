@@ -1,0 +1,465 @@
+/*
+Conway's Life implmementation for Second Life
+Copyright 2023, NovaSquirrel
+
+Copying and distribution of this file, with or without modification, are permitted in any medium without royalty, provided the copyright notice and this notice are preserved. This file is offered as-is, without any warranty.
+*/
+
+#define ROWS 20
+#define COLS 32
+
+// Config
+
+integer ownerOnly = 0;          // Only the owner can use this board
+float delay = 0.5;              // Seconds between ticks
+integer autoRandomLength = 150; // Amount of ticks between random resets
+
+// Miscellaneous variables
+
+list grid;             // Current grid
+list savedGrid;        // Grid used for the save/load feature
+
+list mapLinks;         // Link numbers for the eight rows of the board
+integer touchChangeTo; // What pixel value the board should be changed to while dragging over other cells
+integer running = 0;   // Currently running the grid?
+integer autoRandomTimer = 1;  // Amount of ticks until the next random reset. Zero if disabled.
+
+// Dialog variables
+
+integer dialogChannel;
+integer importChannel;
+integer speedChannel;
+integer listenerHandle;
+
+// Grid functions
+
+// Generate a list of a given size, filled with zeros
+list listOfZeros(integer length) {
+    list out = [];
+    for(; length; --length)
+        out = [0] + out;
+    return out;
+}
+
+// Import RLE format pattern
+importPattern(string text) {
+    llSetText("Importing pattern", <1,1,1>, 1);
+    clearGrid();
+    
+    list lines = llParseString2List(text, ["\n"], []);
+    integer lineIndex;
+    integer lineCount = llGetListLength(lines);
+    integer width = COLS;  // Width of the pattern
+    integer height = ROWS; // Height of the pattern
+    integer currentX;      // X to write to in the grid
+    integer currentY;      // Y to write to in the grid
+    integer repeatCount;   // How many times to repeat the upcoming command
+    
+    // Read each line
+    for(; lineIndex < lineCount; ++lineIndex) {
+        string line = llList2String(lines, lineIndex);
+        if(llGetSubString(line, 0, 0) == "#") {
+            // Comment
+        } else if(llGetSubString(line, 0, 0) == "x") {
+            list info = llParseString2List(line, [",", " "], ["="]);
+
+            // Do some validation on the line
+            if(llList2String(info, 0) == "x" && llList2String(info, 1) == "=" && llList2String(info, 3) == "y" && llList2String(info, 4) == "=") {
+                width = llList2Integer(info, 2);
+                if(width > COLS)
+                    width = COLS;
+                height = llList2Integer(info, 5);
+                if(height > ROWS)
+                    height = ROWS;
+            } else {
+                llWhisper(0, "Imported pattern doesn't seem to be in the right format.");
+                jump Abort;
+            }
+        } else {
+            integer lineLength = llStringLength(line);
+            integer i;
+            for(; i<lineLength; ++i) {
+                integer c = llOrd(line, i);
+                if(c >= 48 && c <= 57) { // Digits
+                    repeatCount = (repeatCount*10) + c-48;
+                    if(repeatCount > COLS) {
+                        llWhisper(0, "Imported pattern is too big!");
+                        jump Abort;
+                    }
+                } else if(c == 111) { // o
+                    if(!repeatCount)
+                        repeatCount = 1;
+                    integer gridIndex = currentY*COLS+currentX;
+                    while(repeatCount) {
+                        grid = llListReplaceList(grid, [1], gridIndex, gridIndex);
+                        ++currentX;
+                        ++gridIndex;
+                        if(currentX >= COLS) {
+                            llWhisper(0, "Imported pattern is too wide!");
+                            jump Abort;
+                        }
+                        --repeatCount;
+                    }                    
+                } else if(c == 98) { // b
+                    if(!repeatCount)
+                        repeatCount = 1;
+                    currentX += repeatCount;
+                    repeatCount = 0;
+                } else if(c == 36) { // $
+                    if(!repeatCount)
+                        repeatCount = 1;
+                    currentX = 0;
+                    currentY += repeatCount;
+                    if(currentY >= ROWS) {
+                        llWhisper(0, "Imported pattern is too tall!");
+                        jump Abort;
+                    }
+                    repeatCount = 0;
+                }
+            }
+        }
+    }
+    
+    // Vertically center the pattern
+    if(height != ROWS) {
+        grid = llList2List(grid, 0, (height*COLS)-1);
+
+        integer linesLeftOver = ROWS - height;
+        integer linesAbove = linesLeftOver / 2;
+        integer linesBelow = linesLeftOver - linesAbove;
+        list emptyRow = listOfZeros(COLS);
+        for(; linesAbove; --linesAbove) {
+            grid = emptyRow + grid;
+        }
+        for(; linesBelow; --linesBelow) {
+            grid = grid + emptyRow;
+        }
+    }
+    
+    // Horizontally center the pattern
+    if(width != COLS) {
+        integer colsLeftOver = COLS - width;
+        integer colsLeft  = colsLeftOver / 2;
+        integer colsRight = colsLeftOver - colsLeft;
+        
+        list padLeft = listOfZeros(colsLeft);
+        list padRight = listOfZeros(colsRight);
+        list newGrid = [];
+        integer row;
+        for(; row<ROWS; ++row) {
+            integer base = row*COLS;
+            newGrid += padLeft + llList2List(grid, base, base+width-1) + padRight;    
+        }
+        grid = newGrid;
+    }
+
+  @Abort;
+    updateDisplay();
+    llSetText("", ZERO_VECTOR, 0);
+}
+
+// Export the board in RLE format
+string exportPattern() {
+    llSetText("Exporting pattern", <1,1,1>, 1);
+
+    string output;
+    integer x;
+    integer y;
+    integer emptyRows;
+
+    for(; y<ROWS; ++y) {
+        string lineOutput = "";
+        integer repeatCount;
+        integer lastValue = -1;
+
+        for(x=0; x<COLS; ++x) {
+            integer value = llList2Integer(grid, y*COLS+x);
+            if(lastValue == value) {
+                ++repeatCount;
+            } else {
+                if(lastValue != -1) {
+                    if(repeatCount > 1)
+                        lineOutput += (string)repeatCount;
+                    if(lastValue)
+                        lineOutput += "o";
+                    else
+                        lineOutput += "b";
+                }
+                repeatCount = 1;
+            }
+            lastValue = value;
+        }
+        // Add on whatever was at the end of the row, unless it's just empty space
+        if(lastValue) {
+            if(repeatCount > 1)
+                lineOutput += (string)repeatCount;
+            lineOutput += "o";
+        }
+        
+        // Squash down multiple $s
+        if(lineOutput) {
+            if(y != 0) {
+                if(emptyRows)
+                    output += (string)(emptyRows+1);
+                output += "$";
+            }
+            output += lineOutput;
+            emptyRows = 0;
+        } else {
+            ++emptyRows;
+        }
+    }
+    llSetText("", ZERO_VECTOR, 0);
+    return "x = "+(string)COLS+", y = "+(string)ROWS+", rule = B3/S23\n" + output+"!";
+}
+    
+randomizeGrid(float chance) {
+    grid = [];
+    integer i;
+    for (; i < (ROWS * COLS); ++i) {
+        grid = [(llFrand(1) < chance)] + grid;
+    }
+}
+
+clearGrid() {
+    grid = listOfZeros(ROWS * COLS);
+}
+
+integer lookup(integer row, integer col) {
+    if(row == -1)
+        return llList2Integer(grid, (ROWS-1)*COLS + (col & 31));
+    return llList2Integer(grid, (row % ROWS)*COLS + (col & 31));
+}
+
+integer neighbors(integer col, integer row) {
+    return lookup(row, col+1)+
+           lookup(row+1, col+1)+
+           lookup(row+1, col)+
+           lookup(row+1, col-1)+
+           lookup(row, col-1)+
+           lookup(row-1, col-1)+
+           lookup(row-1, col)+
+           lookup(row-1, col+1);
+}
+
+startRunning() {
+    running = 1;
+    llSetTimerEvent(delay);
+}
+
+runGrid() {
+    list newGrid = grid;
+ 
+    integer x; integer y;
+    for(x=0; x<COLS; x++) {
+        for(y=0; y<ROWS; y++) {
+            integer neighborCount = neighbors(x, y);
+            integer index = y*COLS+x;
+
+            if(llList2Integer(grid, index)) {
+                if(neighborCount < 2 || neighborCount > 3) {
+                    newGrid = llListReplaceList(newGrid, [0], index, index);
+                }
+            } else if(neighborCount == 3){
+                newGrid = llListReplaceList(newGrid, [1], index, index);
+            }
+        }
+    }
+    grid = newGrid;
+}
+
+integer gridIndexBeingTouched() {
+    vector touchPosition = llDetectedTouchST(0);
+    integer touchFace = llDetectedTouchFace(0);
+    integer touchRow = llListFindList(mapLinks, [llDetectedLinkNumber(0)]);
+    if(touchPosition != TOUCH_INVALID_TEXCOORD) {
+        integer x = (integer)(touchPosition.x * 4);
+        integer y = !(integer)(touchPosition.y * 2);
+        return touchRow*64 + y*32 + touchFace*4 + x;
+    }
+    return -1;
+}
+
+// Draw functions
+
+integer getLinkWithName(string name) {
+    integer i = llGetLinkNumber() != 0;   // Start at zero (single prim) or 1 (two or more prims)
+    integer x = llGetNumberOfPrims() + i; // [0, 1) or [1, llGetNumberOfPrims()]
+    for (; i < x; ++i)
+        if (llGetLinkName(i) == name) 
+            return i;
+    return -1;
+}
+
+vector tileImage(integer tile) {
+    return <0.03125+0.0625*((tile ^ 8) & 15), 0.03125+0.0625*(15 - ((tile^128) >> 4) ), 0>;
+}
+
+updateDisplay() {
+    integer row;
+    integer face;
+    for(; row<10; ++row) {
+        list rules = [];
+        for(face = 0; face < 8; face++) {
+            integer base = row*64 + face*4;
+            
+            rules = [PRIM_TEXTURE, face, "f166f023-74e7-dc2e-7e4c-3afd68bcbbb4", <0.0625,0.0625,0>, tileImage(
+                llList2Integer(grid, base) |
+                (llList2Integer(grid, base+1)<<1) |
+                (llList2Integer(grid, base+2)<<2) |
+                (llList2Integer(grid, base+3)<<3) |
+                (llList2Integer(grid, base+32)<<4) |
+                (llList2Integer(grid, base+33)<<5) |
+                (llList2Integer(grid, base+34)<<6) |
+                (llList2Integer(grid, base+35)<<7)
+            ), 0] + rules;
+        }
+        llSetLinkPrimitiveParamsFast(llList2Integer(mapLinks, row), rules);
+    }
+}
+
+// Events
+
+default {
+    state_entry() {
+        // Find the links, in order
+        integer i;
+        mapLinks = [];
+        for(i=0;i<10;++i)
+            mapLinks += getLinkWithName("Map"+(string)i);
+        
+        dialogChannel = -1 * (integer) llFrand(1000000.0) - 5;
+        importChannel = dialogChannel - 1;
+        speedChannel = importChannel - 1;
+
+        // Start running a random grid
+        randomizeGrid(0.50);
+        updateDisplay();
+        llSetTimerEvent(delay);
+
+        llSetText("", <0,0,0>, 0);
+    }
+    
+    timer() {
+        if(autoRandomTimer) {
+            --autoRandomTimer;
+            if(!autoRandomTimer) {
+                // Reset the timer
+                autoRandomTimer = autoRandomLength;
+                
+                // Do a random grid again
+                randomizeGrid(llFrand(0.25)+0.25);
+                updateDisplay();
+                return;
+            }
+        }
+        // Otherwise, run the grid for a step
+        runGrid();
+        updateDisplay();
+    }
+    
+    touch_start(integer total_number) {
+        if((llDetectedKey(0) != llGetOwner()) && ownerOnly) {
+            llWhisper(0, "This board is currently locked.");
+            return;
+        }
+
+        // Cancel out of auto reset mode
+        autoRandomTimer = 0;
+        
+        // Stop running
+        running = 0;
+        llSetTimerEvent(0);
+        
+        integer touchLink = llDetectedLinkNumber(0);
+        
+        // 1 is the root prim; clicking on it brings up a menu
+        if(touchLink == 1) {
+            llListenRemove(listenerHandle);
+            listenerHandle = llListen(dialogChannel, "", llDetectedKey(0), "");
+            llDialog(llDetectedKey(0), "Menu", ["Start!", "Clear", "Speed", "Save", "Load", "Import", "Export", "25% Random", "50% Random", "Auto reset", "Owner only"], dialogChannel);
+        } else {
+            integer index = gridIndexBeingTouched();
+            if(index != -1) {
+                touchChangeTo = !llList2Integer(grid, index);
+                grid = llListReplaceList(grid, [touchChangeTo], index, index);
+                updateDisplay();
+            }
+        }
+    }
+
+    touch(integer num_detected) {
+        if(llDetectedKey(0) != llGetOwner() && ownerOnly)
+            return;
+        integer touchLink = llDetectedLinkNumber(0);
+        if(touchLink != 1) {
+            integer index = gridIndexBeingTouched();
+            if(index != -1) {
+                // Change the pixel touched unless it's already the desired value
+                if(touchChangeTo != llList2Integer(grid, index)) {
+                    grid = llListReplaceList(grid, [touchChangeTo], index, index);
+                    updateDisplay();
+                }
+            }
+        }
+    }
+    
+    listen(integer chan, string name, key id, string msg) {
+        llListenRemove(listenerHandle);
+
+        if(chan == dialogChannel) {
+            if(msg == "Start!") {
+                startRunning();
+            } else if(msg == "Clear") {
+                clearGrid();
+                updateDisplay();
+            } else if(msg == "Speed") {
+                listenerHandle = llListen(speedChannel, "", id, "");
+                llTextBox(id, "What should the delay be (in seconds)? Should be 0.5 or higher.", speedChannel);
+            } else if(msg == "Save") {
+                savedGrid = grid;
+            } else if(msg == "Load") {
+                if(savedGrid) {
+                    grid = savedGrid;
+                }
+                updateDisplay();
+            } else if(msg == "Import") {
+                listenerHandle = llListen(importChannel, "", id, "");
+                llTextBox(id, "Paste a RLE format pattern here.\nCopying and pasting from Golly should work.", importChannel);
+            } else if(msg == "Export") {
+                 llWhisper(0, "Exported pattern:\n"+exportPattern());
+            } else if(msg == "25% Random") {
+                randomizeGrid(0.25);
+                updateDisplay();
+                startRunning();
+            } else if(msg == "50% Random") {
+                randomizeGrid(0.50);
+                updateDisplay();
+                startRunning();
+            } else if(msg == "Owner only") {
+                if(id == llGetOwner()) {
+                    ownerOnly = !ownerOnly;
+                    if(ownerOnly)
+                        llWhisper(0, "Now only the owner can use this board.");
+                    else
+                        llWhisper(0, "Now everyone can use this board.");
+                }
+            } else if(msg == "Auto reset") {
+                llWhisper(0, "This board will now automatically randomize every "+ (string)autoRandomLength+ " ticks.");
+                autoRandomTimer = autoRandomLength;
+                randomizeGrid(llFrand(0.25)+0.25);
+                updateDisplay();
+                startRunning();
+            }
+        } else if(chan == speedChannel) {
+            float asFloat = (float)msg;
+            if(asFloat >= 0.5) {
+                delay = asFloat;
+                llWhisper(0, "Delay changed to "+msg+".");
+                startRunning();
+            }
+        } else if(chan == importChannel) {
+            importPattern(msg);
+        }
+    }
+}
