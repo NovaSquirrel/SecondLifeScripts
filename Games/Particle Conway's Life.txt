@@ -1,0 +1,450 @@
+/*
+Conway's Life implementation for Second Life (with Particles!)
+Copyright 2015 and 2023, NovaSquirrel
+
+Copying and distribution of this file, with or without modification, are permitted in any medium without royalty, provided the copyright notice and this notice are preserved. This file is offered as-is, without any warranty.
+*/
+
+#define ROWS 20
+#define COLS 20
+#define CURSOR_COUNT 8
+
+#define PARTICLE_LIFETIME 4.5
+#define CURSOR_DELAY_STEPS 8
+#define CURSOR_DELAY_STEP_TIME 0.02
+#define MAIN_TIMER_RATE 5
+
+integer ownerOnly = 0;          // Only the owner can use this board
+integer autoRandomLength = 150; // Amount of ticks between random resets
+
+// Parameters for the particles used to display the grid
+float sizePoint = 0.1;
+vector colorPoint = <1,0,0>;
+list particleParameters;
+
+updateParticleParameters() {
+    sizePoint = ((boardSize.x / COLS) + (boardSize.y / ROWS)) / 2;
+    particleParameters = [
+        PSYS_SRC_TEXTURE, "", 
+        PSYS_PART_START_SCALE, < sizePoint, sizePoint, FALSE >, 
+        PSYS_PART_END_SCALE,   < sizePoint, sizePoint, FALSE >, 
+        PSYS_PART_START_COLOR, colorPoint,
+        PSYS_PART_END_COLOR,   colorPoint,
+     
+        PSYS_SRC_BURST_PART_COUNT, 1,
+        PSYS_SRC_BURST_RATE, 0.045,
+        PSYS_PART_MAX_AGE, PARTICLE_LIFETIME,
+    
+        PSYS_SRC_PATTERN, PSYS_SRC_PATTERN_DROP,
+     
+        PSYS_PART_FLAGS,
+        PSYS_PART_EMISSIVE_MASK
+    ];
+}
+
+changeParticleColor(vector v) {
+    colorPoint = v;
+    updateParticleParameters();
+    startRunning();
+}
+
+updateScaleOptions() {
+    stepX = boardSize.x / COLS;
+    stepY = boardSize.y / ROWS;
+    origin = <-boardSize.x/2+stepX/2, -boardSize.y/2+stepY/2, boardSize.z>;
+    updateParticleParameters();
+}
+
+// -------------------------------------
+
+vector boardSize; // Size of the board prim
+list cursorLinks; // Link counts of all of the boards
+
+vector origin; // Top left of the board
+float stepX;   // Size of one "pixel" horizontally
+float stepY;   // Size of one "pixel" vertically
+
+list grid;                    // The board used to hold the current pattern
+list cursorTimers;            // Amount of ticks left until each cursor is free
+integer autoRandomTimer = 1;  // Amount of ticks until the next random reset. Zero if disabled.
+
+// Dialog variables
+
+integer dialogChannel;
+integer importChannel;
+integer listenerHandle;
+
+// Functions
+
+startRunning() {
+    llSetTimerEvent(MAIN_TIMER_RATE);
+    llSetText("", ZERO_VECTOR, 0);
+    runGrid();
+}
+
+// Generate a list of a given size, filled with zeros
+list listOfZeros(integer length) {
+    list out = [];
+    for(; length; --length)
+        out = [0] + out;
+    return out;
+}
+
+randomizeGrid(float chance) {
+    grid = [];
+    integer i;
+    for (; i < (ROWS * COLS); ++i) {
+        grid = [(llFrand(1) < chance)] + grid;
+    }
+}
+
+// Import RLE format pattern
+importPattern(string text) {
+    llSetText("Importing pattern", <1,1,1>, 1);
+    grid = listOfZeros(ROWS * COLS);
+    
+    list lines = llParseString2List(text, ["\n"], []);
+    integer lineIndex;
+    integer lineCount = llGetListLength(lines);
+    integer width = COLS;  // Width of the pattern
+    integer height = ROWS; // Height of the pattern
+    integer currentX;      // X to write to in the grid
+    integer currentY;      // Y to write to in the grid
+    integer repeatCount;   // How many times to repeat the upcoming command
+    
+    // Read each line
+    for(; lineIndex < lineCount; ++lineIndex) {
+        string line = llList2String(lines, lineIndex);
+        if(llGetSubString(line, 0, 0) == "#") {
+            // Comment
+        } else if(llGetSubString(line, 0, 0) == "x") {
+            list info = llParseString2List(line, [",", " "], ["="]);
+
+            // Do some validation on the line
+            if(llList2String(info, 0) == "x" && llList2String(info, 1) == "=" && llList2String(info, 3) == "y" && llList2String(info, 4) == "=") {
+                width = llList2Integer(info, 2);
+                if(width > COLS)
+                    width = COLS;
+                height = llList2Integer(info, 5);
+                if(height > ROWS)
+                    height = ROWS;
+            } else {
+                llWhisper(0, "Imported pattern doesn't seem to be in the right format.");
+                jump Abort;
+            }
+        } else {
+            integer lineLength = llStringLength(line);
+            integer i;
+            for(; i<lineLength; ++i) {
+                integer c = llOrd(line, i);
+                if(c >= 48 && c <= 57) { // Digits
+                    repeatCount = (repeatCount*10) + c-48;
+                    if(repeatCount > COLS) {
+                        llWhisper(0, "Imported pattern is too big!");
+                        jump Abort;
+                    }
+                } else if(c == 111) { // o
+                    if(!repeatCount)
+                        repeatCount = 1;
+                    integer gridIndex = currentY*COLS+currentX;
+                    while(repeatCount) {
+                        grid = llListReplaceList(grid, [1], gridIndex, gridIndex);
+                        ++currentX;
+                        ++gridIndex;
+                        if(currentX >= COLS) {
+                            llWhisper(0, "Imported pattern is too wide!");
+                            jump Abort;
+                        }
+                        --repeatCount;
+                    }                    
+                } else if(c == 98) { // b
+                    if(!repeatCount)
+                        repeatCount = 1;
+                    currentX += repeatCount;
+                    repeatCount = 0;
+                } else if(c == 36) { // $
+                    if(!repeatCount)
+                        repeatCount = 1;
+                    currentX = 0;
+                    currentY += repeatCount;
+                    if(currentY >= ROWS) {
+                        llWhisper(0, "Imported pattern is too tall!");
+                        jump Abort;
+                    }
+                    repeatCount = 0;
+                }
+            }
+        }
+    }
+    
+    // Vertically center the pattern
+    if(height != ROWS) {
+        grid = llList2List(grid, 0, (height*COLS)-1);
+
+        integer linesLeftOver = ROWS - height;
+        integer linesAbove = linesLeftOver / 2;
+        integer linesBelow = linesLeftOver - linesAbove;
+        list emptyRow = listOfZeros(COLS);
+        for(; linesAbove; --linesAbove) {
+            grid = emptyRow + grid;
+        }
+        for(; linesBelow; --linesBelow) {
+            grid = grid + emptyRow;
+        }
+    }
+    
+    // Horizontally center the pattern
+    if(width != COLS) {
+        integer colsLeftOver = COLS - width;
+        integer colsLeft  = colsLeftOver / 2;
+        integer colsRight = colsLeftOver - colsLeft;
+        
+        list padLeft = listOfZeros(colsLeft);
+        list padRight = listOfZeros(colsRight);
+        list newGrid = [];
+        integer row;
+        for(; row<ROWS; ++row) {
+            integer base = row*COLS;
+            newGrid += padLeft + llList2List(grid, base, base+width-1) + padRight;    
+        }
+        grid = newGrid;
+    }
+
+  @Abort;
+    llSetText("", ZERO_VECTOR, 0);
+}
+
+integer getLinkWithName(string name) {
+    integer i = llGetLinkNumber() != 0;   // Start at zero (single prim) or 1 (two or more prims)
+    integer x = llGetNumberOfPrims() + i; // [0, 1) or [1, llGetNumberOfPrims()]
+    for (; i < x; ++i)
+        if (llGetLinkName(i) == name) 
+            return i;
+    return -1;
+}
+
+integer lookup(integer row, integer col) {
+    if(row == -1) row = ROWS - 1;
+    if(col == -1) col = COLS - 1;
+    row %= ROWS;
+    col %= COLS;
+    return llList2Integer(grid, row*COLS+col);
+}
+
+integer neighbors(integer row, integer col) {
+    return lookup(row, col+1)+
+           lookup(row+1, col+1)+
+           lookup(row+1, col)+
+           lookup(row+1, col-1)+
+           lookup(row, col-1)+
+           lookup(row-1, col-1)+
+           lookup(row-1, col)+
+           lookup(row-1, col+1);
+}
+
+integer tickCursorTimers() {
+    integer i;
+    integer allZero = 1; // Have all of the timers been set to zero yet?
+    for(; i<CURSOR_COUNT; i++) {
+        integer value = llList2Integer(cursorTimers, i);
+        if(value) {
+            allZero = 0;
+            cursorTimers = llListReplaceList(cursorTimers, [value-1], i, i);
+            if(value == 1) {
+                llLinkParticleSystem(llList2Integer(cursorLinks, i), []);
+            }
+        }
+    }
+    llSleep(CURSOR_DELAY_STEP_TIME);
+    return allZero;
+}
+
+runGrid() {
+    list newGrid = grid;
+    list pixelsToShow = [];
+    integer index;
+    
+    // Calculate the next grid
+    
+    integer x; integer y; integer n;
+    for(y=0; y<ROWS; y++) {
+        for(x=0; x<COLS; x++) {
+            index = y*COLS+x;
+            n = neighbors(y, x);
+            
+            if(llList2Integer(grid, index)) {
+                pixelsToShow = [index] + pixelsToShow;
+                if(n < 2 || n > 3) {
+                    newGrid = llListReplaceList(newGrid, [0], index, index);
+                }
+            } else if(n == 3){
+                newGrid = llListReplaceList(newGrid, [1], index, index);
+            }
+        }
+    }
+    grid = newGrid;
+    newGrid = []; // Clear up some memory
+    
+    // Display the new grid
+
+    integer numberOfOnPixels = llGetListLength(pixelsToShow);
+    cursorTimers = [0, 0, 0, 0, 0, 0, 0, 0]; // Extend if you add more cursors
+    
+    for(n=0; n < numberOfOnPixels;) {
+        // Find a free cursor
+        integer foundFree = -1;
+        for(x = 0; x<CURSOR_COUNT; x++) {
+            if(!llList2Integer(cursorTimers, x)) {
+                foundFree = x;
+            }
+        }
+        
+        // If anything is free, use it, otherwise wait
+        if(foundFree >= 0) {
+            cursorTimers = llListReplaceList(cursorTimers, [CURSOR_DELAY_STEPS], foundFree, foundFree);
+
+            index = llList2Integer(pixelsToShow, n++);
+            integer link = llList2Integer(cursorLinks, foundFree);
+            llSetLinkPrimitiveParamsFast(link, [PRIM_POSITION,
+                origin + <
+                (float)(index%COLS)*stepX,
+                (float)(index/COLS)*stepY,
+                0>]);
+            llLinkParticleSystem(link, particleParameters);
+        } else {
+            tickCursorTimers();
+        }
+    }
+    
+    // Turn off the cursors that are still on
+    while(!tickCursorTimers());
+}
+
+default {
+    state_entry() {
+        boardSize = llGetScale();
+
+        // Find all of the cursors
+        cursorLinks = [];
+        integer i;
+        for(i=0;i<CURSOR_COUNT;++i) {
+            integer link = getLinkWithName("Cursor "+(string)i);
+            llLinkParticleSystem(link, []);
+            cursorLinks += [link];
+        }
+        llSetText("", ZERO_VECTOR, 0);
+
+        // Set up the variables
+        dialogChannel = -1 * (integer) llFrand(1000000.0) - 5;
+        importChannel = dialogChannel - 1;
+
+        randomizeGrid(0.50);
+        updateScaleOptions();
+                
+        // Start simulating!
+        llSetTimerEvent(MAIN_TIMER_RATE);
+        runGrid();
+    }
+
+    touch_start(integer num) {
+        if((llDetectedKey(0) != llGetOwner()) && ownerOnly) {
+            llWhisper(0, "This board is currently locked.");
+            return;
+        }
+
+        // Cancel out of auto reset mode
+        autoRandomTimer = 0;
+        
+        llSetTimerEvent(0); // Stop the timer
+        llSetText("Paused", <1,1,1>, 1);
+        
+        llListenRemove(listenerHandle);
+        listenerHandle = llListen(dialogChannel, "", llDetectedKey(0), "");
+        llDialog(llDetectedKey(0), "Menu", ["Unpause", "Import", "Color", "25% Random", "50% Random", "Auto reset", "Owner only"], dialogChannel);
+    }
+    
+    listen(integer chan, string name, key id, string msg) {
+        llListenRemove(listenerHandle);
+
+        if(chan == dialogChannel) {
+            if(msg == "Unpause") {
+                startRunning();
+            } else if(msg == "Import") {
+                listenerHandle = llListen(importChannel, "", id, "");
+                llTextBox(id, "Paste a RLE format pattern here.\nCopying and pasting from Golly should work.", importChannel);
+            } else if(msg == "25% Random") {
+                randomizeGrid(0.25);
+                startRunning();
+            } else if(msg == "50% Random") {
+                randomizeGrid(0.50);
+                startRunning();
+            } else if(msg == "Owner only") {
+                if(id == llGetOwner()) {
+                    ownerOnly = !ownerOnly;
+                    if(ownerOnly)
+                        llWhisper(0, "Now only the owner can use this board.");
+                    else
+                        llWhisper(0, "Now everyone can use this board.");
+                }
+            } else if(msg == "Auto reset") {
+                llWhisper(0, "This board will now automatically randomize every "+ (string)autoRandomLength+ " ticks.");
+                randomizeGrid(llFrand(0.25)+0.25);
+                startRunning();
+            } else if(msg == "Color") {
+                listenerHandle = llListen(dialogChannel, "", id, "");
+                llDialog(id, "Pick a color", ["Red", "Green", "Blue", "Yellow", "Cyan", "Magenta", "White", "Pink", "Orange", "Purple", "Brown"], dialogChannel);
+            // Color selection - there's definitely a better way to do this
+            } else if(msg == "Red") {
+                changeParticleColor(<1,0,0>);
+            } else if(msg == "Green") {
+                changeParticleColor(<0,1,0>);
+            } else if(msg == "Blue") {
+                changeParticleColor(<0,0,1>);
+            } else if(msg == "Yellow") {
+                changeParticleColor(<1,1,0>);
+            } else if(msg == "Cyan") {
+                changeParticleColor(<0,1,1>);
+            } else if(msg == "White") {
+                changeParticleColor(<1,1,1>);
+            } else if(msg == "Pink") {
+                changeParticleColor(<1,0.65,0.65>);
+            } else if(msg == "Orange") {
+                changeParticleColor(<1,0.5,0>);
+            } else if(msg == "Purple") {
+                changeParticleColor(<0.5,0,1>);
+            } else if(msg == "Brown") {
+                changeParticleColor(<0.5,0.25,0>);
+            }
+        } else if(chan == importChannel) {
+            importPattern(msg);
+            startRunning();
+        }
+    }
+
+    timer() {
+        if(autoRandomTimer) {
+            --autoRandomTimer;
+            if(!autoRandomTimer) {
+                // Reset the timer
+                autoRandomTimer = autoRandomLength;
+                
+                // Do a random grid again
+                randomizeGrid(llFrand(0.25)+0.25);
+            }
+        }
+        
+        // Run grid for a step
+        runGrid();
+    }
+
+    on_rez(integer param) {llResetScript();}
+    changed(integer mask) {
+        if(mask & CHANGED_OWNER) {
+            llResetScript();
+        }
+        if(mask & CHANGED_SCALE) {
+            boardSize = llGetScale();
+            updateScaleOptions();
+        }
+    } 
+}
