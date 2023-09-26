@@ -1,0 +1,224 @@
+#define COMMAND_CHANNEL 1234
+#define AUTH_HEADER_VALUE "Basic YWJjOmRlZg=="
+#define SL_DNS_URL "https://example.com"
+#define PASSWORD_FOR_GET "password"
+
+string url;
+key urlRequestId;
+key httpRequestId;
+
+integer detectedPeopleCount = 0;
+list currentVisitorDetails = []; // List of JSON objects detailing each detected person
+list lastDetectedNames = []; // Names in "Display Name (Username)" format
+
+integer listenHandleChat;
+integer listenHandleCommand;
+list recentEvents = [];
+integer doChatLogging = 1;
+
+string urlWithPass() {
+    return url+"?"+PASSWORD_FOR_GET;
+}
+
+logEvent(string type, string name, string param) {
+    if(param != "")
+        recentEvents = [llList2Json(JSON_ARRAY, [llGetUnixTime(), type, name, param])] + llList2List(recentEvents, 0, 48);
+    else
+        recentEvents = [llList2Json(JSON_ARRAY, [llGetUnixTime(), type, name])] + llList2List(recentEvents, 0, 48);    
+}
+
+sendUrlToVPS() {
+    llHTTPRequest( SL_DNS_URL + "/v1/sldns/" + llGetRegionName(), [HTTP_METHOD, "PUT", HTTP_CUSTOM_HEADER, "Authorization", AUTH_HEADER_VALUE], urlWithPass());
+}
+
+noticePeopleLeaving(list newList) {
+    integer count = llGetListLength(lastDetectedNames);
+    integer i;
+    for(i = 0; i < count; ++i)
+    {
+        string displayNameAndUsername = llList2String(lastDetectedNames, i);
+        if(llListFindList(newList, [displayNameAndUsername]) == -1) {
+            logEvent(displayNameAndUsername, "gone", "");
+        }
+    }
+}
+
+string jsonBool(integer i) {
+    if(i)
+        return JSON_TRUE;
+    return JSON_FALSE;
+}
+
+string jsonVector(vector v) {
+     return llList2Json(JSON_ARRAY, [v.x, v.y, v.z]);
+}
+
+default
+{
+    state_entry()
+    {
+        urlRequestId = llRequestURL();
+        llSensorRepeat("", "", AGENT_BY_LEGACY_NAME, 10.0, PI, 30.0);
+        listenHandleChat = llListen(PUBLIC_CHANNEL, "",  NULL_KEY, "");
+        listenHandleCommand = llListen(COMMAND_CHANNEL, "", llGetOwner(), "");
+    }
+    
+    on_rez(integer i) 
+    {
+        llResetScript();
+    }
+    
+    changed(integer change)
+    {
+        if (change & (CHANGED_OWNER | CHANGED_INVENTORY))
+            llResetScript();
+        if (change & (CHANGED_REGION | CHANGED_REGION_START | CHANGED_TELEPORT))
+            urlRequestId = llRequestURL();
+    }
+    
+    /*
+    touch_start(integer num_detected) {       
+    }
+    */
+    
+    listen(integer channel, string name, key id, string chat_message)
+    {
+        if(channel == PUBLIC_CHANNEL && doChatLogging) {
+            string displayName = llGetDisplayName(id);
+            logEvent(displayName + " (" + name + ")", "chat", chat_message);
+        } else if(channel == COMMAND_CHANNEL && id == llGetOwner()) {
+            if(chat_message == "!NSP chaton") {
+                doChatLogging = 1;
+                llOwnerSay("Chat logging enabled");
+            } else if(chat_message == "!NSP chatoff") {
+                doChatLogging = 0;
+                recentEvents = [];
+                llOwnerSay("Chat logging disabled");
+            } else if(chat_message == "!NSP clear") {
+                recentEvents = [];
+                llOwnerSay("Event history cleared");
+            } else if(chat_message == "!NSP url") {
+                llOwnerSay("URL "+urlWithPass());
+            } else if(chat_message == "!NSP resend") {
+                sendUrlToVPS();
+                llOwnerSay("Resending URL to VPS");
+            } else if(chat_message == "!NSP test") {
+                llOwnerSay("Test!");
+            } else if(chat_message == "!NSP help") {
+                llOwnerSay("Commands are: chaton, chatoff, clear, url, resend, test, help");
+            }
+        }
+    }
+    
+    no_sensor() 
+    {
+        currentVisitorDetails = [];
+        detectedPeopleCount = 0;
+        noticePeopleLeaving([]);
+        lastDetectedNames = [];
+    }
+        
+    sensor(integer number_detected) 
+    {
+        list thisDetectedNames = [];
+                
+        currentVisitorDetails = [];
+        detectedPeopleCount = number_detected;
+
+        integer i;
+        for(i = 0; i < number_detected; ++i)
+        {
+            key visitorKey = llDetectedKey(i);
+            
+            // Detect new people
+            string displayName = llGetDisplayName(visitorKey);
+            string username = llDetectedName(i);
+            string displayNameAndUsername = displayName + " ("+username+")"; 
+            if(llListFindList(lastDetectedNames, [displayNameAndUsername]) == -1) {
+                logEvent(displayNameAndUsername, "seen", "");
+            }
+            thisDetectedNames += displayNameAndUsername;
+            
+            list visitorInfo = llGetObjectDetails(visitorKey, [OBJECT_RUNNING_SCRIPT_COUNT, OBJECT_TOTAL_SCRIPT_COUNT, OBJECT_SCRIPT_MEMORY, OBJECT_SCRIPT_TIME, OBJECT_RENDER_WEIGHT]);
+            currentVisitorDetails += llList2Json(JSON_OBJECT, 
+            [
+            "username", llDetectedName(i),
+            "display_name", llGetDisplayName(visitorKey),
+            "distance", llVecDist(llGetPos(), llDetectedPos(i)),
+            "parcel_name", llList2String(llGetParcelDetails(llDetectedPos(i), [PARCEL_DETAILS_NAME] ), 0),
+            "in_my_parcel", jsonBool(llOverMyLand(visitorKey)),
+            "position", jsonVector(llDetectedPos(i)),
+            "running_script_count", llList2Integer(visitorInfo, 0),
+            "total_script_count", llList2Integer(visitorInfo, 1),
+            "total_script_memory", llList2Integer(visitorInfo, 2),
+            "total_script_time", llList2Float(visitorInfo, 3),
+            "render_weight", llList2Integer(visitorInfo, 4)
+            ]);
+        }
+
+        noticePeopleLeaving(thisDetectedNames);
+             
+        // Save the current results to compare against next time
+        lastDetectedNames = thisDetectedNames;
+    }
+     
+    http_response(key request_id, integer status, list metadata, string body)
+    {
+        if (request_id != httpRequestId)
+            return;
+        llOwnerSay(body);
+    }
+
+    http_request(key id, string method, string body)
+    {
+        if (id == urlRequestId)
+        {
+            if (method == URL_REQUEST_DENIED)
+                llOwnerSay("The following error occurred while attempting to get a free URL for this device:\n \n" + body);    
+            else if (method == URL_REQUEST_GRANTED) {
+                url = body;
+                sendUrlToVPS();
+                //llOwnerSay("URL: "+urlWithPass());
+            }
+        }
+        else if (method == "GET")
+        {
+            if(llGetHTTPHeader(id, "x-query-string") != PASSWORD_FOR_GET
+            && llGetHTTPHeader(id, "Authorization") != AUTH_HEADER_VALUE) {
+                llHTTPResponse(id, 401, "Wrong password");
+                return;
+            }
+
+            llSetContentType(id, CONTENT_TYPE_JSON);
+            string sl_stats = llList2Json(JSON_OBJECT, [
+            "name", llGetRegionName(),
+            "agents_in_region", llGetSimStats(SIM_STAT_AGENT_COUNT),
+            "agents_in_neighbors", llGetSimStats(SIM_STAT_CHILD_AGENT_COUNT),
+            "dilation", llGetRegionTimeDilation(),
+            "fps", llGetRegionFPS(),
+            "physics_fps", llGetSimStats(SIM_STAT_PHYSICS_FPS),
+            "idle", jsonBool((integer)llGetEnv("region_idle")),
+            "active_scripts", llGetSimStats(SIM_STAT_ACTIVE_SCRIPT_COUNT),
+            "script_ms", llGetSimStats(SIM_STAT_SCRIPT_MS),
+            "script_events", llGetSimStats(SIM_STAT_SCRIPT_EPS),
+            "packets_in", llGetSimStats(SIM_STAT_PACKETS_IN),
+            "packets_out", llGetSimStats(SIM_STAT_PACKETS_OUT),
+            "sleep_ms", llGetSimStats(SIM_STAT_SLEEP_MS),
+            "spare_ms", llGetSimStats(SIM_STAT_SPARE_MS)
+            ]);
+            llHTTPResponse(id, 200, llList2Json( JSON_OBJECT, [
+            "my_position", jsonVector(llGetPos()),
+            "region_stats", sl_stats,
+            "people_nearby_count", detectedPeopleCount,
+            "people_nearby_list", llList2Json(JSON_ARRAY, currentVisitorDetails),
+            "time", llGetUnixTime(),
+            "chat_logging", jsonBool(doChatLogging),
+            "recent_events", llList2Json(JSON_ARRAY, recentEvents)
+            ] ));
+        }
+        else
+        {
+            llHTTPResponse(id, 405, "Method unsupported");
+        }
+    }
+}
