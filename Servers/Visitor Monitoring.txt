@@ -3,6 +3,14 @@
 #define SL_DNS_URL "https://example.com"
 #define PASSWORD_FOR_GET "password"
 
+#define SENSOR_DISTANCE 96.0
+#define SENSOR_RATE 30.0
+#define HIDE_PEOPLE_ON_PRIVATE_PARCEL
+//#define MY_PARCEL_ONLY
+
+// Set MAX_EVENT_LOG to two less than the actual size you want
+#define MAX_EVENT_LOG 58
+
 string url;
 key urlRequestId;
 key httpRequestId;
@@ -24,7 +32,7 @@ logEvent(string type, string name, string param) {
     if(param != "")
         recentEvents = [llList2Json(JSON_ARRAY, [llGetUnixTime(), type, name, param])] + llList2List(recentEvents, 0, 48);
     else
-        recentEvents = [llList2Json(JSON_ARRAY, [llGetUnixTime(), type, name])] + llList2List(recentEvents, 0, 48);    
+        recentEvents = [llList2Json(JSON_ARRAY, [llGetUnixTime(), type, name])] + llList2List(recentEvents, 0, MAX_EVENT_LOG);    
 }
 
 sendUrlToVPS() {
@@ -58,7 +66,7 @@ default
     state_entry()
     {
         urlRequestId = llRequestURL();
-        llSensorRepeat("", "", AGENT_BY_LEGACY_NAME, 10.0, PI, 30.0);
+        llSensorRepeat("", "", AGENT_BY_LEGACY_NAME, SENSOR_DISTANCE, PI, SENSOR_RATE);
         listenHandleChat = llListen(PUBLIC_CHANNEL, "",  NULL_KEY, "");
         listenHandleCommand = llListen(COMMAND_CHANNEL, "", llGetOwner(), "");
     }
@@ -130,6 +138,14 @@ default
         {
             key visitorKey = llDetectedKey(i);
             
+            vector position = llDetectedPos(i);
+            integer parcelFlags = llGetParcelFlags(position);
+
+            if(parcelFlags & (PARCEL_FLAG_USE_ACCESS_GROUP | PARCEL_FLAG_USE_ACCESS_LIST))
+                jump skip_this_person;
+            //if(llOverMyLand(visitorKey) == 0)
+            //    jump skip_this_person;            
+            
             // Detect new people
             string displayName = llGetDisplayName(visitorKey);
             string username = llDetectedName(i);
@@ -144,16 +160,17 @@ default
             [
             "username", llDetectedName(i),
             "display_name", llGetDisplayName(visitorKey),
-            "distance", llVecDist(llGetPos(), llDetectedPos(i)),
+            "distance", llVecDist(llGetPos(), position),
             "parcel_name", llList2String(llGetParcelDetails(llDetectedPos(i), [PARCEL_DETAILS_NAME] ), 0),
             "in_my_parcel", jsonBool(llOverMyLand(visitorKey)),
-            "position", jsonVector(llDetectedPos(i)),
+            "position", jsonVector(position),
             "running_script_count", llList2Integer(visitorInfo, 0),
             "total_script_count", llList2Integer(visitorInfo, 1),
             "total_script_memory", llList2Integer(visitorInfo, 2),
             "total_script_time", llList2Float(visitorInfo, 3),
             "render_weight", llList2Integer(visitorInfo, 4)
             ]);
+            @skip_this_person;
         }
 
         noticePeopleLeaving(thisDetectedNames);
@@ -204,7 +221,8 @@ default
             "packets_in", llGetSimStats(SIM_STAT_PACKETS_IN),
             "packets_out", llGetSimStats(SIM_STAT_PACKETS_OUT),
             "sleep_ms", llGetSimStats(SIM_STAT_SLEEP_MS),
-            "spare_ms", llGetSimStats(SIM_STAT_SPARE_MS)
+            "spare_ms", llGetSimStats(SIM_STAT_SPARE_MS),
+            "frame_ms", llGetSimStats(SIM_STAT_FRAME_MS)
             ]);
             llHTTPResponse(id, 200, llList2Json( JSON_OBJECT, [
             "my_position", jsonVector(llGetPos()),
